@@ -9,3 +9,7 @@ seed: 0
 device_id: 0
 output_path: None
 test_method: tiger
+
+# Optional wall-clock budget for downstream recommender training only.
+# Null preserves the original step/early-stop behavior.
+time_budget_seconds: null

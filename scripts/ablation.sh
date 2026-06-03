@@ -16,6 +16,7 @@ python run.py \
     method.embedding_head_dict.embed_target="ground_truth+item_id" \
     method.embedding_head_dict.embed_proj_type="linear" \
     method.embedding_head_dict.use_new_init=True \
+    time_budget_seconds=600 \
     experiment_id="ablation_dense_id"
 
 
@@ -29,6 +30,7 @@ python run.py \
     method=setting \
     test_method=liger \
     method.sid_loss_weight=0 \
+    time_budget_seconds=600 \
     experiment_id="ablation_dense_sid"
 
 
@@ -40,6 +42,7 @@ python run.py \
     device_id=0 \
     method=setting \
     test_method=liger \
+    time_budget_seconds=600 \
     experiment_id="ablation_liger" 
 
 
@@ -53,6 +56,7 @@ python run.py \
     test_method=liger \
     method.flag_use_output_embedding=False \
     method.embedding_loss_weight=0 \
+    time_budget_seconds=600 \
     experiment_id="ablation_tiger_text"
 
 
@@ -64,4 +68,5 @@ python run.py \
     device_id=0 \
     method=base \
     test_method=tiger \
+    time_budget_seconds=600 \
     experiment_id="ablation_tiger"

@@ -7,6 +7,7 @@ LICENSE file in the root directory of this source tree.
 """
 
 import os
+import time
 
 import numpy as np
 import torch
@@ -207,13 +208,27 @@ def train_epoch(
     method_config,
     item2sid,
     item_embedding,
+    global_step_start=0,
+    time_budget_start=None,
+    time_budget_seconds=None,
 ):
-    progress_bar = tqdm(range(len(train_dataloader)))
+    progress_bar = tqdm(total=len(train_dataloader))
     model.train()
     all_ids = np.arange(item2sid.shape[0]) + 1
     unseen_ids = np.setdiff1d(all_ids, seen_ids)
+    deadline = None
+    if time_budget_start is not None and time_budget_seconds is not None:
+        deadline = time_budget_start + float(time_budget_seconds)
+
+    steps_trained = 0
+    stopped_by_time_budget = False
+    loss = hard_loss = embedding_loss = grad_norm = None
 
     for batch in train_dataloader:
+        if deadline is not None and time.monotonic() >= deadline:
+            stopped_by_time_budget = True
+            break
+
         optimizer.zero_grad()
 
         outputs, _ = model_forward(
@@ -256,20 +271,34 @@ def train_epoch(
         if scheduler is not None:
             scheduler.step()
 
+        steps_trained += 1
+        progress_bar.update(1)
+
+        if deadline is not None and time.monotonic() >= deadline:
+            stopped_by_time_budget = True
+            break
+
     progress_bar.close()
 
-    logs = {
-        "train/loss": loss.item(),
-        "train/epoch": epoch + 1,
-        "train/lr": get_lr(optimizer),
-        "train/grad_norm": grad_norm,
-    }
-    logs["train/sid_loss"] = hard_loss
-    logs["train/embedding_loss"] = embedding_loss
+    if steps_trained > 0:
+        logs = {
+            "train/loss": loss.item(),
+            "train/epoch": epoch + 1,
+            "train/step": global_step_start + steps_trained,
+            "train/lr": get_lr(optimizer),
+            "train/grad_norm": grad_norm,
+        }
+        logs["train/sid_loss"] = hard_loss
+        logs["train/embedding_loss"] = embedding_loss
 
-    writer.log(logs)
+        if time_budget_start is not None and time_budget_seconds is not None:
+            logs["budget/time_limit_seconds"] = float(time_budget_seconds)
+            logs["budget/elapsed_seconds"] = time.monotonic() - time_budget_start
+            logs["budget/time_budget_reached"] = int(stopped_by_time_budget)
 
-    return model
+        writer.log(logs)
+
+    return model, steps_trained, stopped_by_time_budget
 
 
 def train_tiger(
@@ -286,6 +315,9 @@ def train_tiger(
     output_path = config["output_path"]
     codebook_size = config["RQ-VAE"]["code_book_size"]
     max_items_per_seq = config["max_items_per_seq"]
+    time_budget_seconds = orig_config.get("time_budget_seconds", None)
+    if time_budget_seconds is not None:
+        time_budget_seconds = float(time_budget_seconds)
 
     writer = setup_logging(orig_config)
 
@@ -463,6 +495,17 @@ def train_tiger(
     start_epoch = -1
     state_path = output_path + "/ckpt.pt"
     best_state_path = output_path + "/results/ckpt_best.pt"
+    stopped_by = "completed_steps"
+    time_budget_start = None
+
+    if time_budget_seconds is not None:
+        writer.log(
+            {
+                "budget/time_limit_seconds": time_budget_seconds,
+                "budget/elapsed_seconds": 0,
+                "budget/time_budget_reached": 0,
+            }
+        )
 
     optimizer = AdamW(
         model.parameters(),
@@ -506,10 +549,12 @@ def train_tiger(
                     state[k] = v.to(device)
         print("Load the model from: ", state_path)
 
+    time_budget_start = time.monotonic()
+
     for epoch in range(
         start_epoch + 1, int(np.ceil(total_steps / len(train_dataloader)))
     ):
-        model = train_epoch(
+        model, steps_trained, stopped_by_time_budget = train_epoch(
             epoch,
             train_dataloader,
             model,
@@ -524,10 +569,15 @@ def train_tiger(
             method_config,
             item2sid,
             item_embedding,
+            global_step_start=global_step,
+            time_budget_start=time_budget_start,
+            time_budget_seconds=time_budget_seconds,
         )
-        global_step += len(train_dataloader)
+        global_step += steps_trained
 
-        if (epoch + 1) % trainer_config["eval_frequence"] == 0:
+        if (epoch + 1) % trainer_config["eval_frequence"] == 0 or (
+            stopped_by_time_budget and steps_trained > 0
+        ):
 
             logs, ndcg_at_10 = evaluate_helper(
                 model,
@@ -542,8 +592,12 @@ def train_tiger(
                 RETRIEVE_KEY=RETRIEVE_KEY,
             )
             logs["train/step"] = global_step
+            if time_budget_seconds is not None:
+                logs["budget/time_limit_seconds"] = time_budget_seconds
+                logs["budget/elapsed_seconds"] = time.monotonic() - time_budget_start
+                logs["budget/time_budget_reached"] = int(stopped_by_time_budget)
 
-            if ndcg_at_10 > best_ndcg_10:
+            if ndcg_at_10 > best_ndcg_10 or not os.path.exists(best_state_path):
                 best_ndcg_10 = ndcg_at_10
                 best_epoch = epoch
                 model.cpu()
@@ -560,14 +614,27 @@ def train_tiger(
                 "best_ndcg_10": best_ndcg_10,
                 "global_step": global_step,
                 "best_epoch": best_epoch,
+                "time_budget_seconds": time_budget_seconds,
+                "elapsed_seconds": time.monotonic() - time_budget_start,
             }
             torch.save(training_state, state_path)
+
+        if stopped_by_time_budget:
+            stopped_by = "time_budget"
+            print(f"Finish because the time budget of {time_budget_seconds}s ran out.")
+            break
 
         if (
             best_epoch + trainer_config["patience"] < epoch
         ) and global_step > trainer_config["warmup_steps"]:
+            stopped_by = "early_stop"
             print("Finish because the patience run out.")
             break
+
+    if not os.path.exists(best_state_path):
+        model.cpu()
+        torch.save(model.state_dict(), best_state_path)
+        model.to(device)
 
     print("Testing...")
 
@@ -595,6 +662,14 @@ def train_tiger(
         RETRIEVE_KEY=RETRIEVE_KEY,
     )
 
+    elapsed_seconds = time.monotonic() - time_budget_start
+    logs["final/global_step"] = global_step
+    logs["final/elapsed_seconds"] = elapsed_seconds
+    logs["final/stopped_by"] = stopped_by
+    if time_budget_seconds is not None:
+        logs["budget/time_limit_seconds"] = time_budget_seconds
+        logs["budget/elapsed_seconds"] = elapsed_seconds
+        logs["budget/time_budget_reached"] = int(stopped_by == "time_budget")
     writer.log(logs)
     writer.finish()
 
